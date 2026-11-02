@@ -2690,11 +2690,16 @@ function saveSettingsStorage(s) { localStorage.setItem('mashawi_settings', JSON.
 async function renderMenu() {
   const grid = document.getElementById('menuGrid');
   if (!grid) return;
-  // عرض شاشة تحميل مؤقتة أثناء الجلب
-  grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text-mute);">
-    <div style="font-size:48px;margin-bottom:14px;">🛍️</div>
-    <p>جاري تحميل المنتجات…</p>
-  </div>`;
+  // تحقق إن كان الـ grid يحتوي على منتجات بالفعل
+  const hasExistingProducts = grid.querySelector('.dish') !== null;
+  // عرض شاشة تحميل فقط إذا كان الـ grid فارغاً (أول مرة)
+  // — هذا يمنع "الاختفاء ثم الإعادة" المزعج أثناء التحديث التلقائي
+  if (!hasExistingProducts) {
+    grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text-mute);">
+      <div style="font-size:48px;margin-bottom:14px;">🛍️</div>
+      <p>جاري تحميل المنتجات…</p>
+    </div>`;
+  }
   let dishes;
   try {
     dishes = await loadDishes();
@@ -2712,6 +2717,8 @@ async function renderMenu() {
   saveDishesStorage(dishes);
   // تخزين قائمة المنتجات الحالية لاستخدامها في عارض الصور (الزوم / 360°)
   window._lastRenderedDishes = dishes;
+  // تحديث بصمة البيانات لمنع إعادة بناء غير ضرورية في التحديث التلقائي
+  window._lastDishesSignature = dishes.map(d => `${d.id}:${d.name}:${d.price}:${d.available}:${d.image||''}:${d.defaultImage||''}`).join('|');
 
   // تطبيق فلتر الفئة الحالي + فلتر البحث
   const activeCat = window._activeCategory || 'all';
@@ -4090,20 +4097,43 @@ function init() {
 
   // SheetDB: تحقق من الاتصال عند الإقلاع
   checkSheetConnection();
-  // تحديث المؤشر كل 30 ثانية
-  setInterval(checkSheetConnection, 30000);
+  // تحديث المؤشر كل 60 ثانية (بدلاً من 30 لتقليل الطلبات)
+  setInterval(checkSheetConnection, 60000);
 
-  // كل 15 ثانية، نتحقق إن كانت الأطباق قد تغيّرت في الشيت من الخارج
-  // (مثلاً: عدّل صاحب المحل الشيت يدوياً) — نعيد تحميل القائمة دون لمس المحرّر
+  // تحديث ذكي للقائمة: يتحقق فقط إن تغيّرت البيانات فعلاً قبل إعادة البناء
+  // — يمنع "الريفرش" المزعج الذي يُخفي المحتوى ثم يُعيده
+  let _autoRefreshInProgress = false;
   setInterval(async () => {
-    // لا نعيد التحميل إذا كانت لوحة الإدارة مفتوحة على تبويب الأطباق (حتى لا نُضيّع التعديلات)
+    // لا نعيد التحميل أثناء تفاعل المستخدم لتجنّب إزعاجه
     const adminOpen = document.getElementById('adminModal')?.classList.contains('active');
-    const dishesTabActive = document.querySelector('.admin-tab[data-tab="dishes"]')?.classList.contains('active');
-    if (adminOpen && dishesTabActive) return;
-    // وإلا فنعيد التحميل بهدوء
-    _dishesCache = null;
-    try { await renderMenu(); } catch (e) { console.warn('auto-refresh failed:', e); }
-  }, 15000);
+    const viewerOpen = document.getElementById('imageViewerOverlay')?.classList.contains('active');
+    const cartOpen = document.getElementById('cartModal')?.classList.contains('active');
+    if (adminOpen || viewerOpen || cartOpen) return; // المستخدم مشغول — لا تُحدّث
+    if (_autoRefreshInProgress) return; // تحديث جارٍ بالفعل
+    _autoRefreshInProgress = true;
+    try {
+      // جلب البيانات الجديدة دون مسح الكاش القديم فوراً
+      const freshDishes = await loadDishes().catch(() => null);
+      if (!freshDishes || !freshDishes.length) { _autoRefreshInProgress = false; return; }
+      // توليد بصمة للبيانات لمقارنتها بسرعة
+      const signature = freshDishes.map(d => `${d.id}:${d.name}:${d.price}:${d.available}:${d.image||''}:${d.defaultImage||''}`).join('|');
+      if (signature === window._lastDishesSignature) {
+        // البيانات لم تتغيّر — لا حاجة لإعادة البناء (منع الوميض/الريفرش)
+        _autoRefreshInProgress = false;
+        return;
+      }
+      // البيانات تغيّرت فعلاً — حدّث الكاش وأعد البناء
+      window._lastDishesSignature = signature;
+      saveDishesStorage(freshDishes);
+      window._lastRenderedDishes = freshDishes;
+      // أعد بناء القائمة فقط إذا لم يكن المستخدم يتفاعل حالياً
+      await renderMenu();
+    } catch (e) {
+      console.warn('auto-refresh failed:', e);
+    } finally {
+      _autoRefreshInProgress = false;
+    }
+  }, 120000); // كل دقيقتين (بدلاً من 15 ثانية)
 
   // عند الضغط على شارة الاتصال: فتح لوحة الإدارة على تبويب الطلبات
   const syncBadge = document.getElementById('syncBadge');
@@ -4511,19 +4541,20 @@ function init() {
   const HOVER_ZOOM_SCALE = 2.6;   // نسبة التكبير
   let currentImg = null;          // الصورة الحالية المعروضة
   let hoverTimer = null;          // مؤجّل لإظهار النافذة (يمنع الوميض)
+  let lastClientX = 0, lastClientY = 0;
+  let moveScheduled = false;      // تقييد تحديث موضع النافذة (throttle)
+  let attachDone = false;         // منع تكرار ربط الأحداث
+  let scrollTimer = null;
 
   // إظهار النافذة المنبثقة بجانب الصورة
   function showHoverZoom(imgEl, clientX, clientY) {
-    const src = imgEl.src || (imgEl.currentSrc) || '';
+    const src = imgEl.src || imgEl.currentSrc || '';
     if (!src) return;
     currentImg = imgEl;
     hoverZoom.style.backgroundImage = `url("${src}")`;
-    // حساب حجم الصورة الأصلية لتحديد حجم الخلفية المكبّرة
     const iw = imgEl.naturalWidth || imgEl.width || 1;
     const ih = imgEl.naturalHeight || imgEl.height || 1;
-    const zoomW = iw * HOVER_ZOOM_SCALE;
-    const zoomH = ih * HOVER_ZOOM_SCALE;
-    hoverZoom.style.backgroundSize = `${zoomW}px ${zoomH}px`;
+    hoverZoom.style.backgroundSize = `${iw * HOVER_ZOOM_SCALE}px ${ih * HOVER_ZOOM_SCALE}px`;
     positionAndFocus(clientX, clientY);
     hoverZoom.classList.add('visible');
   }
@@ -4534,50 +4565,33 @@ function init() {
     const imgRect = currentImg.getBoundingClientRect();
     const iw = currentImg.naturalWidth || currentImg.width || 1;
     const ih = currentImg.naturalHeight || currentImg.height || 1;
-    // نسبة موضع الماوس على الصورة (0..1)
     let rx = (clientX - imgRect.left) / (imgRect.width || 1);
     let ry = (clientY - imgRect.top) / (imgRect.height || 1);
     rx = Math.max(0, Math.min(1, rx));
     ry = Math.max(0, Math.min(1, ry));
-    // حجم النافذة المنبثقة
-    const zoomRect = hoverZoom.getBoundingClientRect();
-    const zw = zoomRect.width || 320;
-    const zh = zoomRect.height || 320;
-    // صورة المنتج (imgRect مُعرّفة سابقاً)
-    // منطق تحديد الموضع: نريد النافذة بجانب الصورة دون تداخل
-    // 1) جرّب يمين الصورة
+    const zw = hoverZoom.offsetWidth || 320;
+    const zh = hoverZoom.offsetHeight || 320;
     let zx, zy;
     const rightOfImage = imgRect.right + 8;
     const leftOfImage = imgRect.left - zw - 8;
     const aboveImage = imgRect.top - zh - 8;
     const belowImage = imgRect.bottom + 8;
-    // تحديد الموضع الرأسي: توسيط مع الماوس أو مع الصورة
     const centerY = clientY - zh / 2;
-    // يفضّل يمين الصورة، ثم يسارها، ثم فوقها، ثم تحتها
-    if (rightOfImage + zw <= window.innerWidth - 8) {
-      zx = rightOfImage;
-      zy = clampY(centerY);
-    } else if (leftOfImage >= 8) {
-      zx = leftOfImage;
-      zy = clampY(centerY);
-    } else if (aboveImage >= 8) {
-      zx = clampX(imgRect.left + (imgRect.width - zw) / 2);
-      zy = aboveImage;
-    } else if (belowImage + zh <= window.innerHeight - 8) {
-      zx = clampX(imgRect.left + (imgRect.width - zw) / 2);
-      zy = belowImage;
-    } else {
-      // الملاذ الأخير: يمين الماوس مع إزاحة
-      zx = clampX(clientX + 24);
-      zy = clampY(centerY);
-    }
     function clampX(v) { return Math.max(8, Math.min(v, window.innerWidth - zw - 8)); }
     function clampY(v) { return Math.max(8, Math.min(v, window.innerHeight - zh - 8)); }
-    zy = clampY(zy);
-    zx = clampX(zx);
+    if (rightOfImage + zw <= window.innerWidth - 8) {
+      zx = rightOfImage; zy = clampY(centerY);
+    } else if (leftOfImage >= 8) {
+      zx = leftOfImage; zy = clampY(centerY);
+    } else if (aboveImage >= 8) {
+      zx = clampX(imgRect.left + (imgRect.width - zw) / 2); zy = aboveImage;
+    } else if (belowImage + zh <= window.innerHeight - 8) {
+      zx = clampX(imgRect.left + (imgRect.width - zw) / 2); zy = belowImage;
+    } else {
+      zx = clampX(clientX + 24); zy = clampY(centerY);
+    }
     hoverZoom.style.left = zx + 'px';
     hoverZoom.style.top = zy + 'px';
-    // موضع خلفية الصورة المكبّرة بحيث تظهر المنطقة المُشار إليها في وسط النافذة
     const bgPosX = -(rx * iw * HOVER_ZOOM_SCALE - zw / 2);
     const bgPosY = -(ry * ih * HOVER_ZOOM_SCALE - zh / 2);
     hoverZoom.style.backgroundPosition = `${bgPosX}px ${bgPosY}px`;
@@ -4587,59 +4601,74 @@ function init() {
     hoverZoom.classList.remove('visible');
     currentImg = null;
     if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+    moveScheduled = false;
   }
 
-  // تفويض الأحداث على شبكة المنتجات (يعمل حتى بعد إعادة الرسم)
+  // تقييد تحديث الموضع عبر requestAnimationFrame (يمنع الإفراط في الإعادة الرسم)
+  function scheduleMove(clientX, clientY) {
+    lastClientX = clientX;
+    lastClientY = clientY;
+    if (moveScheduled) return;
+    moveScheduled = true;
+    requestAnimationFrame(() => {
+      moveScheduled = false;
+      if (currentImg) positionAndFocus(lastClientX, lastClientY);
+    });
+  }
+
+  // تفويض الأحداث على شبكة المنتجات — يُربط مرة واحدة فقط
   function attachHoverZoom() {
+    if (attachDone) return;
     const grid = document.getElementById('menuGrid');
     if (!grid) return;
-    // mouseenter على كل صورة (تفويض)
+    attachDone = true;
+
     grid.addEventListener('mouseover', (e) => {
       const dishImg = e.target.closest('.dish-img');
       if (!dishImg) return;
       const imgEl = dishImg.querySelector('img');
       if (!imgEl) return;
-      // تجاهل المنتجات غير المتوفرة؟ لا — اعرض التفاصيل دائماً
-      dishImg.classList.add('with-hover-zoom');
-      if (currentImg === imgEl) return; // نفس الصورة، لا داعي لإعادة التهيئة
-      // تأخير بسيط لمنع الوميض عند المرور السريع
+      if (currentImg === imgEl) return; // نفس الصورة
       if (hoverTimer) clearTimeout(hoverTimer);
       hoverTimer = setTimeout(() => showHoverZoom(imgEl, e.clientX, e.clientY), 80);
     });
+
     grid.addEventListener('mousemove', (e) => {
       if (!currentImg) return;
-      positionAndFocus(e.clientX, e.clientY);
+      scheduleMove(e.clientX, e.clientY);
     });
+
     grid.addEventListener('mouseout', (e) => {
       const dishImg = e.target.closest('.dish-img');
       if (!dishImg) return;
       const related = e.relatedTarget;
-      // إن كان المغادر إليه خارج نفس الصورة، أخفِ النافذة
       if (!related || !dishImg.contains(related)) {
         hideHoverZoom();
       }
     });
-    // إخفاء عند الخروج من الشبكة
+
     grid.addEventListener('mouseleave', hideHoverZoom);
   }
 
-  // التهيئة بعد تحميل الصفحة
+  // التهيئة بعد تحميل الصفحة (مرة واحدة فقط)
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => setTimeout(attachHoverZoom, 300));
   } else {
     setTimeout(attachHoverZoom, 300);
   }
-  // إعادة الربط بعد كل render (لأن renderMenu يُعيد بناء grid)
-  window.addEventListener('load', () => setTimeout(attachHoverZoom, 600));
-  // مراقب MutationObserver لإعادة الربط عند تغيّر محتوى الشبكة
-  const mo = new MutationObserver(() => {
-    // لا حاجة لإعادة الربط لأن الأحداث مُفوّضة على grid نفسه
-  });
-  const grid0 = document.getElementById('menuGrid');
-  if (grid0) mo.observe(grid0, { childList: true });
 
-  // إخفاء عند التمرير السريع (لمنع الالتصاق)
+  // إخفاء عند التمرير (مع تقييد لمنع الإفراط)
   window.addEventListener('scroll', () => {
+    if (!currentImg) return;
+    if (scrollTimer) return;
+    scrollTimer = setTimeout(() => {
+      scrollTimer = null;
+      if (currentImg) hideHoverZoom();
+    }, 100);
+  }, { passive: true });
+
+  // إخفاء عند تغيير حجم النافذة
+  window.addEventListener('resize', () => {
     if (currentImg) hideHoverZoom();
   }, { passive: true });
 })();
